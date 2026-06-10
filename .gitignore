@@ -1,0 +1,5 @@
+# Arduino build cache
+*.d
+*.elf
+*.map
+firmware/build/*.ino.elf

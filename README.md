@@ -1,5 +1,8 @@
 # Wardriving Halo
 
+> **⚠️ Work in Progress — Developer Help Wanted**
+> This project is actively being developed. Contributions, bug reports, and pull requests are welcome. If you want to help improve the Android app or firmware, open an issue or reach out.
+
 ESP32-S3 wardriving firmware + companion Android app for passive WiFi/Bluetooth network mapping.
 
 ## Hardware

@@ -1,7 +1,7 @@
 # Wardriving Halo
 
 > **⚠️ Work in Progress — Developer Help Wanted**
-> This project is actively being developed. Contributions, bug reports, and pull requests are welcome. If you want to help improve the Android app or firmware, open an issue or reach out.
+> This project is actively being developed. The long-term goal is to grow this into a **full ethical hacker's toolkit** running on the Spec5 / Spectre 2 MK2 hardware — combining wardriving, network analysis, and RF tools in one portable device. Contributions, bug reports, and pull requests are welcome. If you want to help build it out, open an issue or reach out.
 
 ESP32-S3 wardriving firmware + companion Android app for passive WiFi/Bluetooth network mapping.
 

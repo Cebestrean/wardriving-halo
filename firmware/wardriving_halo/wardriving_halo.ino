@@ -5,8 +5,9 @@
  * - /data/aircraft.json  — WiFi scan results (dump1090 format)
  * - /data/signals.json   — same data for signal view
  * - /json/fromradio      — empty Meshtastic packet array []
- * - /battery             — {"level":N,"voltage":0.0}
- * USB CDC BAT: output maintained for PC monitoring.
+ * - /battery             — {"level":N,"voltage":V}
+ * - /gps  (POST)         — receive satellite/location data from phone
+ * PRG button (GPIO0) cycles OLED pages: Main → Satellite → Networks
  */
 
 #include <WiFi.h>
@@ -15,8 +16,6 @@
 #include "HT_SSD1306Wire.h"
 
 // ── USB JTAG TX FIFO — direct register access ──────────────────────────────
-// Bypasses usb_serial_jtag_is_connected() which always returns false in the
-// Arduino boot path (IDF driver context never initialized).
 #define USJ_EP1_REG      (*((volatile uint32_t *)0x60038000))
 #define USJ_EP1_CONF_REG (*((volatile uint32_t *)0x60038004))
 #define USJ_INT_RAW_REG  (*((volatile uint32_t *)0x60038008))
@@ -40,6 +39,7 @@ static void usjWrite(const char *s) {
 #define PIN_OLED_RST     21
 #define PIN_BATT_ADC      1
 #define PIN_BATT_CTRL    37   // LOW = enable battery voltage divider
+#define PIN_BTN           0   // PRG button, active LOW
 
 // ── Battery ────────────────────────────────────────────────────────────────
 float battVoltage = 0.0f;
@@ -50,13 +50,13 @@ float battVoltage = 0.0f;
 
 int readBattPct() {
     pinMode(PIN_BATT_CTRL, OUTPUT);
-    digitalWrite(PIN_BATT_CTRL, LOW);   // enable voltage divider
+    digitalWrite(PIN_BATT_CTRL, LOW);
     delay(5);
     analogSetPinAttenuation(PIN_BATT_ADC, ADC_11db);
     uint32_t mv = 0;
     for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_BATT_ADC);
     mv /= 8;
-    digitalWrite(PIN_BATT_CTRL, HIGH);  // disable to save power
+    digitalWrite(PIN_BATT_CTRL, HIGH);
     battVoltage = (mv / 1000.0f) * BATT_RATIO;
     if (battVoltage < 0.5f) return 0;
     int pct = (int)((battVoltage - BATT_EMPTY) / (BATT_FULL - BATT_EMPTY) * 100.0f);
@@ -73,8 +73,8 @@ WebServer httpServer(80);
 #define MAX_NETS 64
 
 struct WifiNet {
-    char hex[13];   // 12 hex chars + null
-    char ssid[65];  // SSID + null
+    char hex[13];
+    char ssid[65];
     int  rssi;
     int  channel;
 };
@@ -84,9 +84,31 @@ static int      netCount  = 0;
 static uint32_t scanMsgs  = 0;
 static bool     scanning  = false;
 
-// ── OLED ───────────────────────────────────────────────────────────────────
+// ── GPS / Satellite data (posted by phone via /gps) ────────────────────────
+struct GpsInfo {
+    double lat       = 0.0;
+    double lon       = 0.0;
+    float  accuracy  = 0.0f;
+    float  altitude  = 0.0f;
+    float  speed     = 0.0f;
+    float  bearing   = 0.0f;
+    int    sats      = 0;
+    bool   valid     = false;
+    unsigned long updatedAt = 0;
+};
+static GpsInfo gpsInfo;
+
+// ── OLED + menu ────────────────────────────────────────────────────────────
 SSD1306Wire oled(0x3c, 700000, PIN_OLED_SDA, PIN_OLED_SCL, GEOMETRY_128_64, PIN_OLED_RST);
 bool oledOk = false;
+
+#define PAGE_MAIN  0
+#define PAGE_SAT   1
+#define PAGE_NETS  2
+#define NUM_PAGES  3
+
+int  currentPage  = PAGE_MAIN;
+bool lastBtnState = HIGH;
 
 int   battPct      = 0;
 bool  otgConnected = false;
@@ -96,6 +118,7 @@ unsigned long lastBatSend    = 0;
 unsigned long lastOledUpdate = 0;
 unsigned long lastScanStart  = 0;
 unsigned long lastOledRetry  = 0;
+unsigned long lastBtnMs      = 0;
 
 // ── JSON string escape ─────────────────────────────────────────────────────
 static String jsonEsc(const char *s) {
@@ -124,10 +147,10 @@ static String buildAircraftJson() {
     json += ",\"aircraft\":[";
     for (int i = 0; i < netCount; i++) {
         if (i > 0) json += ",";
-        json += "{\"hex\":\"";    json += nets[i].hex;
+        json += "{\"hex\":\"";      json += nets[i].hex;
         json += "\",\"flight\":\""; json += jsonEsc(nets[i].ssid);
         json += "\",\"alt_baro\":"; json += nets[i].rssi;
-        json += ",\"gs\":";       json += nets[i].channel;
+        json += ",\"gs\":";         json += nets[i].channel;
         json += ",\"track\":0,\"lat\":0.0,\"lon\":0.0,\"messages\":1,\"seen\":0}";
     }
     json += "]}";
@@ -147,7 +170,36 @@ void handleFromRadio()     { sendJson("[]"); }
 void handleBattery()       { sendJson("{\"level\":" + String(battPct) + ",\"voltage\":" + String(battVoltage, 2) + "}"); }
 void handleNotFound()      { httpServer.send(404, "text/plain", "Not found"); }
 
-// ── I2C recovery + OLED ────────────────────────────────────────────────────
+// Simple float extractor from JSON string (no library needed)
+static float jsonFloat(const String &body, const char *key) {
+    int idx = body.indexOf(key);
+    if (idx < 0) return 0.0f;
+    idx = body.indexOf(':', idx);
+    if (idx < 0) return 0.0f;
+    idx++;
+    while (idx < (int)body.length() && body[idx] == ' ') idx++;
+    return body.substring(idx).toFloat();
+}
+
+void handleGpsPost() {
+    if (httpServer.method() != HTTP_POST) {
+        httpServer.send(405, "text/plain", "POST only");
+        return;
+    }
+    String body = httpServer.arg("plain");
+    gpsInfo.lat      = (double)jsonFloat(body, "\"lat\"");
+    gpsInfo.lon      = (double)jsonFloat(body, "\"lon\"");
+    gpsInfo.accuracy = jsonFloat(body, "\"acc\"");
+    gpsInfo.altitude = jsonFloat(body, "\"alt\"");
+    gpsInfo.speed    = jsonFloat(body, "\"spd\"");
+    gpsInfo.bearing  = jsonFloat(body, "\"brg\"");
+    gpsInfo.sats     = (int)jsonFloat(body, "\"sats\"");
+    gpsInfo.valid    = true;
+    gpsInfo.updatedAt = millis();
+    sendJson("{\"ok\":true}");
+}
+
+// ── I2C recovery ───────────────────────────────────────────────────────────
 void i2cRecover() {
     pinMode(PIN_OLED_SCL, OUTPUT);
     pinMode(PIN_OLED_SDA, OUTPUT);
@@ -160,6 +212,59 @@ void i2cRecover() {
     digitalWrite(PIN_OLED_SDA, HIGH); delayMicroseconds(5);
 }
 
+// ── OLED page draws ────────────────────────────────────────────────────────
+static void drawHeader(const char *title) {
+    oled.drawString(0, 0, title);
+    oled.drawLine(0, 11, 127, 11);
+}
+
+static void drawPageMain() {
+    drawHeader("Wardriving Halo");
+    oled.drawString(0, 14, "Bat: " + String(battPct) + "% (" + String(battVoltage, 2) + "V)");
+    oled.drawRect(0, 27, 100, 8);
+    int barW = (battPct * 98) / 100;
+    if (barW > 0) oled.fillRect(1, 28, barW, 6);
+    String apLine = "AP: " AP_SSID;
+    if (otgConnected) apLine += " OTG";
+    oled.drawString(0, 38, apLine);
+    oled.drawString(0, 51, String(netCount) + " nets | " + String(scanMsgs) + " seen");
+}
+
+static void drawPageSat() {
+    drawHeader("-- Satellite --");
+    if (!gpsInfo.valid) {
+        oled.drawString(0, 20, "No GPS data yet.");
+        oled.drawString(0, 34, "Open app & scan.");
+        return;
+    }
+    unsigned long age = (millis() - gpsInfo.updatedAt) / 1000;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Lat: %.5f", gpsInfo.lat);
+    oled.drawString(0, 14, buf);
+    snprintf(buf, sizeof(buf), "Lon: %.5f", gpsInfo.lon);
+    oled.drawString(0, 25, buf);
+    snprintf(buf, sizeof(buf), "Sats:%d  Acc:%.0fm", gpsInfo.sats, gpsInfo.accuracy);
+    oled.drawString(0, 36, buf);
+    snprintf(buf, sizeof(buf), "Alt:%.0fm  %lus ago", gpsInfo.altitude, age);
+    oled.drawString(0, 47, buf);
+}
+
+static void drawPageNets() {
+    drawHeader("-- Networks --");
+    if (netCount == 0) {
+        oled.drawString(0, 24, "Scanning...");
+        return;
+    }
+    int show = min(netCount, 4);
+    for (int i = 0; i < show; i++) {
+        char ssid[14];
+        snprintf(ssid, sizeof(ssid), "%-13s", nets[i].ssid);
+        char line[22];
+        snprintf(line, sizeof(line), "%s%4d", ssid, nets[i].rssi);
+        oled.drawString(0, 14 + i * 13, line);
+    }
+}
+
 void drawOled() {
     if (!oledOk) return;
     oled.displayOn();
@@ -167,17 +272,11 @@ void drawOled() {
     oled.setFont(ArialMT_Plain_10);
     oled.setTextAlignment(TEXT_ALIGN_LEFT);
 
-    oled.drawString(0,  0, "Wardriving Halo");
-    oled.drawString(0, 13, "Bat: " + String(battPct) + "% (" + String(battVoltage, 2) + "V)");
-
-    oled.drawRect(0, 26, 100, 10);
-    int barW = (battPct * 98) / 100;
-    if (barW > 0) oled.fillRect(1, 27, barW, 8);
-
-    String apLine = "AP: " AP_SSID;
-    if (otgConnected) apLine += " OTG";
-    oled.drawString(0, 40, apLine);
-    oled.drawString(0, 52, String(netCount) + " nets | " + String(scanMsgs) + " seen");
+    switch (currentPage) {
+        case PAGE_SAT:  drawPageSat();  break;
+        case PAGE_NETS: drawPageNets(); break;
+        default:        drawPageMain(); break;
+    }
 
     oled.display();
 }
@@ -187,9 +286,11 @@ void setup() {
     Serial.begin(115200);
     delay(100);
 
+    pinMode(PIN_BTN, INPUT_PULLUP);
+
     pinMode(PIN_VEXT, OUTPUT);
     digitalWrite(PIN_VEXT, LOW);
-    delay(500);  // longer settle for battery power rail
+    delay(500);
 
     pinMode(PIN_OLED_RST, OUTPUT);
     digitalWrite(PIN_OLED_RST, LOW); delay(50);
@@ -215,10 +316,8 @@ void setup() {
     usjWrite("=== Wardriving Halo ===\n");
     lastBatSend = millis();
 
-    // AP+STA: AP hosts the phone; STA mode allows background WiFi scanning
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
-
     IPAddress ip = WiFi.softAPIP();
 
     if (oledOk) {
@@ -234,14 +333,15 @@ void setup() {
     snprintf(ipbuf, sizeof(ipbuf), "AP IP: %s\n", ip.toString().c_str());
     usjWrite(ipbuf);
 
-    httpServer.on("/data/aircraft.json", HTTP_GET, handleAircraftJson);
-    httpServer.on("/data/signals.json",  HTTP_GET, handleSignalsJson);
-    httpServer.on("/json/fromradio",     HTTP_GET, handleFromRadio);
-    httpServer.on("/battery",            HTTP_GET, handleBattery);
+    httpServer.on("/data/aircraft.json", HTTP_GET,  handleAircraftJson);
+    httpServer.on("/data/signals.json",  HTTP_GET,  handleSignalsJson);
+    httpServer.on("/json/fromradio",     HTTP_GET,  handleFromRadio);
+    httpServer.on("/battery",            HTTP_GET,  handleBattery);
+    httpServer.on("/gps",                HTTP_POST, handleGpsPost);
     httpServer.onNotFound(handleNotFound);
     httpServer.begin();
 
-    WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
+    WiFi.scanNetworks(true, true);
     scanning = true;
     lastScanStart = millis();
 }
@@ -255,8 +355,16 @@ void loop() {
         USJ_INT_CLR_REG = USJ_SOF_INT;
         lastSofSeen = now;
     }
-    bool wasConnected = otgConnected;
     otgConnected = (now - lastSofSeen) < 3000UL;
+
+    // PRG button — cycle pages on press with 200ms debounce
+    bool btnNow = digitalRead(PIN_BTN);
+    if (lastBtnState == HIGH && btnNow == LOW && now - lastBtnMs > 200UL) {
+        lastBtnMs = now;
+        currentPage = (currentPage + 1) % NUM_PAGES;
+        lastOledUpdate = 0;  // force immediate redraw
+    }
+    lastBtnState = btnNow;
 
     battPct = readBattPct();
 
@@ -296,8 +404,7 @@ void loop() {
         }
     }
 
-    // Rescan every 10s
-    if (!scanning && (now - lastScanStart >= 10000UL)) {
+    if (!scanning && now - lastScanStart >= 10000UL) {
         lastScanStart = now;
         WiFi.scanNetworks(true, true);
         scanning = true;
@@ -305,7 +412,7 @@ void loop() {
 
     httpServer.handleClient();
 
-    // Retry OLED init every 5s if it failed at boot (battery startup race)
+    // Retry OLED init every 5s if boot-time init failed
     if (!oledOk && now - lastOledRetry >= 5000UL) {
         lastOledRetry = now;
         i2cRecover();
@@ -314,7 +421,7 @@ void loop() {
         if (oledOk) oled.flipScreenVertically();
     }
 
-    // Redraw OLED every 2s (always on, regardless of USB state)
+    // Redraw every 2s
     if (now - lastOledUpdate >= 2000UL) {
         lastOledUpdate = now;
         drawOled();

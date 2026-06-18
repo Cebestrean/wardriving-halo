@@ -112,6 +112,14 @@
 
     :gps_bearing_skip
 
+    # POST GPS data to DICE on a background thread (fire-and-forget, errors silently dropped)
+    new-instance v0, Lcom/wifihalo/viewmodel/HaloGpsPostRunnable;
+    iget-object v1, p0, Lcom/wifihalo/viewmodel/HaloViewModel$startScanning$2$1;->this$0:Lcom/wifihalo/viewmodel/HaloViewModel;
+    invoke-direct {v0, p1, v1}, Lcom/wifihalo/viewmodel/HaloGpsPostRunnable;-><init>(Landroid/location/Location;Lcom/wifihalo/viewmodel/HaloViewModel;)V
+    new-instance v1, Ljava/lang/Thread;
+    invoke-direct {v1, v0}, Ljava/lang/Thread;-><init>(Ljava/lang/Runnable;)V
+    invoke-virtual {v1}, Ljava/lang/Thread;->start()V
+
     .line 880
     iget-object v0, p0, Lcom/wifihalo/viewmodel/HaloViewModel$startScanning$2$1;->this$0:Lcom/wifihalo/viewmodel/HaloViewModel;
 

@@ -34,11 +34,12 @@ static void usjWrite(const char *s) {
 }
 
 // ── Hardware pins ──────────────────────────────────────────────────────────
-#define PIN_VEXT      36
-#define PIN_OLED_SDA  17
-#define PIN_OLED_SCL  18
-#define PIN_OLED_RST  21
-#define PIN_BATT_ADC   1
+#define PIN_VEXT         36
+#define PIN_OLED_SDA     17
+#define PIN_OLED_SCL     18
+#define PIN_OLED_RST     21
+#define PIN_BATT_ADC      1
+#define PIN_BATT_CTRL    37   // LOW = enable battery voltage divider
 
 // ── Battery ────────────────────────────────────────────────────────────────
 float battVoltage = 0.0f;
@@ -48,10 +49,14 @@ float battVoltage = 0.0f;
 #define BATT_EMPTY   3.00f
 
 int readBattPct() {
+    pinMode(PIN_BATT_CTRL, OUTPUT);
+    digitalWrite(PIN_BATT_CTRL, LOW);   // enable voltage divider
+    delay(5);
     analogSetPinAttenuation(PIN_BATT_ADC, ADC_11db);
     uint32_t mv = 0;
     for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_BATT_ADC);
     mv /= 8;
+    digitalWrite(PIN_BATT_CTRL, HIGH);  // disable to save power
     battVoltage = (mv / 1000.0f) * BATT_RATIO;
     if (battVoltage < 0.5f) return 0;
     int pct = (int)((battVoltage - BATT_EMPTY) / (BATT_FULL - BATT_EMPTY) * 100.0f);

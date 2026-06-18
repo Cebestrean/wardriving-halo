@@ -87,6 +87,7 @@ unsigned long lastSofSeen    = 0;
 unsigned long lastBatSend    = 0;
 unsigned long lastOledUpdate = 0;
 unsigned long lastScanStart  = 0;
+unsigned long lastOledRetry  = 0;
 
 // ── JSON string escape ─────────────────────────────────────────────────────
 static String jsonEsc(const char *s) {
@@ -153,6 +154,7 @@ void i2cRecover() {
 
 void drawOled() {
     if (!oledOk) return;
+    oled.displayOn();
     oled.clear();
     oled.setFont(ArialMT_Plain_10);
     oled.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -179,14 +181,14 @@ void setup() {
 
     pinMode(PIN_VEXT, OUTPUT);
     digitalWrite(PIN_VEXT, LOW);
-    delay(150);
+    delay(500);  // longer settle for battery power rail
 
     pinMode(PIN_OLED_RST, OUTPUT);
-    digitalWrite(PIN_OLED_RST, LOW); delay(20);
-    digitalWrite(PIN_OLED_RST, HIGH); delay(20);
+    digitalWrite(PIN_OLED_RST, LOW); delay(50);
+    digitalWrite(PIN_OLED_RST, HIGH); delay(50);
 
     i2cRecover();
-    delay(50);
+    delay(100);
 
     oledOk = oled.init();
     if (oledOk) {
@@ -295,8 +297,17 @@ void loop() {
 
     httpServer.handleClient();
 
-    // Redraw OLED on OTG change or every 5s
-    if (otgConnected != wasConnected || now - lastOledUpdate >= 5000UL) {
+    // Retry OLED init every 5s if it failed at boot (battery startup race)
+    if (!oledOk && now - lastOledRetry >= 5000UL) {
+        lastOledRetry = now;
+        i2cRecover();
+        delay(50);
+        oledOk = oled.init();
+        if (oledOk) oled.flipScreenVertically();
+    }
+
+    // Redraw OLED every 2s (always on, regardless of USB state)
+    if (now - lastOledUpdate >= 2000UL) {
         lastOledUpdate = now;
         drawOled();
     }

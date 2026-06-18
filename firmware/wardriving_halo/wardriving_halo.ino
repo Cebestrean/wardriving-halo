@@ -41,17 +41,20 @@ static void usjWrite(const char *s) {
 #define PIN_BATT_ADC   1
 
 // ── Battery ────────────────────────────────────────────────────────────────
+float battVoltage = 0.0f;
+
 #define BATT_RATIO   4.9f
 #define BATT_FULL    4.20f
 #define BATT_EMPTY   3.00f
 
 int readBattPct() {
     analogSetPinAttenuation(PIN_BATT_ADC, ADC_11db);
-    int raw = analogRead(PIN_BATT_ADC);
-    float v_adc  = raw * 3.3f / 4095.0f;
-    float v_batt = v_adc * BATT_RATIO;
-    if (v_batt < 0.5f) return 0;
-    int pct = (int)((v_batt - BATT_EMPTY) / (BATT_FULL - BATT_EMPTY) * 100.0f);
+    uint32_t mv = 0;
+    for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_BATT_ADC);
+    mv /= 8;
+    battVoltage = (mv / 1000.0f) * BATT_RATIO;
+    if (battVoltage < 0.5f) return 0;
+    int pct = (int)((battVoltage - BATT_EMPTY) / (BATT_FULL - BATT_EMPTY) * 100.0f);
     return constrain(pct, 0, 100);
 }
 
@@ -80,8 +83,8 @@ static bool     scanning  = false;
 SSD1306Wire oled(0x3c, 700000, PIN_OLED_SDA, PIN_OLED_SCL, GEOMETRY_128_64, PIN_OLED_RST);
 bool oledOk = false;
 
-int  battPct      = 0;
-bool otgConnected = false;
+int   battPct      = 0;
+bool  otgConnected = false;
 
 unsigned long lastSofSeen    = 0;
 unsigned long lastBatSend    = 0;
@@ -136,7 +139,7 @@ static void sendJson(const String &body) {
 void handleAircraftJson() { sendJson(buildAircraftJson()); }
 void handleSignalsJson()   { sendJson(buildAircraftJson()); }
 void handleFromRadio()     { sendJson("[]"); }
-void handleBattery()       { sendJson("{\"level\":" + String(battPct) + ",\"voltage\":0.0}"); }
+void handleBattery()       { sendJson("{\"level\":" + String(battPct) + ",\"voltage\":" + String(battVoltage, 2) + "}"); }
 void handleNotFound()      { httpServer.send(404, "text/plain", "Not found"); }
 
 // ── I2C recovery + OLED ────────────────────────────────────────────────────
@@ -160,7 +163,7 @@ void drawOled() {
     oled.setTextAlignment(TEXT_ALIGN_LEFT);
 
     oled.drawString(0,  0, "Wardriving Halo");
-    oled.drawString(0, 13, "Bat: " + String(battPct) + "%");
+    oled.drawString(0, 13, "Bat: " + String(battPct) + "% (" + String(battVoltage, 2) + "V)");
 
     oled.drawRect(0, 26, 100, 10);
     int barW = (battPct * 98) / 100;
